@@ -32,6 +32,8 @@ interface StoredManifest {
 const CHUNK_SIZE = Number(process.env.LEGADO_SUBSCRIPTION_CHUNK_SIZE || 100);
 const TIMEOUT_MS = Number(process.env.LEGADO_SUBSCRIPTION_TIMEOUT_MS || process.env.LEGADO_TIMEOUT_MS || 30000);
 const MAX_BYTES = Number(process.env.LEGADO_SUBSCRIPTION_MAX_BYTES || 20 * 1024 * 1024);
+const sourcesCache = new Map<string, BookSource[]>();
+const sourcesLoadPromises = new Map<string, Promise<BookSource[]>>();
 
 function stableId(input: string) {
   return crypto.createHash('sha1').update(input).digest('hex').slice(0, 16);
@@ -131,6 +133,24 @@ async function readManifest(id: string): Promise<StoredManifest | null> {
   }
 }
 
+async function readSourcesFromDb(id: string): Promise<BookSource[]> {
+  const manifest = await readManifest(id);
+  if (!manifest) return [];
+  const chunks = await Promise.all(
+    Array.from({ length: manifest.chunkCount }, async (_, index) => {
+      const raw = await db.getGlobalValue(chunkKey(id, index));
+      if (!raw) return [] as BookSource[];
+      try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? (parsed as BookSource[]) : [];
+      } catch {
+        return [] as BookSource[];
+      }
+    })
+  );
+  return chunks.flat();
+}
+
 export const legadoSubscriptionStore = {
   makeId: subscriptionId,
 
@@ -163,25 +183,30 @@ export const legadoSubscriptionStore = {
     }
     const manifest: StoredManifest = { id, name, url, hash, sourceCount: sources.length, chunkCount, updatedAt: Date.now(), etag, lastModified };
     await db.setGlobalValue(manifestKey(id), JSON.stringify(manifest));
+    sourcesLoadPromises.delete(id);
+    sourcesCache.set(id, sources);
     return { id, name, url, enabled: true, sourceCount: sources.length, lastSyncAt: manifest.updatedAt, lastSuccessAt: manifest.updatedAt, lastError: '' };
   },
 
   async getSources(id: string): Promise<BookSource[]> {
-    const manifest = await readManifest(id);
-    if (!manifest) return [];
-    const chunks = await Promise.all(
-      Array.from({ length: manifest.chunkCount }, async (_, index) => {
-        const raw = await db.getGlobalValue(chunkKey(id, index));
-        if (!raw) return [] as BookSource[];
-        try {
-          const parsed = JSON.parse(raw);
-          return Array.isArray(parsed) ? (parsed as BookSource[]) : [];
-        } catch {
-          return [] as BookSource[];
-        }
+    const cached = sourcesCache.get(id);
+    if (cached) return cached;
+
+    const pending = sourcesLoadPromises.get(id);
+    if (pending) return pending;
+
+    const promise = readSourcesFromDb(id)
+      .then((sources) => {
+        sourcesCache.set(id, sources);
+        sourcesLoadPromises.delete(id);
+        return sources;
       })
-    );
-    return chunks.flat();
+      .catch((error) => {
+        sourcesLoadPromises.delete(id);
+        throw error;
+      });
+    sourcesLoadPromises.set(id, promise);
+    return promise;
   },
 
   async getSourcesForSubscriptions(subscriptions: LegadoSubscriptionMeta[] = []): Promise<BookSource[]> {
@@ -191,6 +216,8 @@ export const legadoSubscriptionStore = {
   },
 
   async delete(id: string): Promise<void> {
+    sourcesLoadPromises.delete(id);
+    sourcesCache.delete(id);
     const manifest = await readManifest(id);
     if (manifest) {
       for (let index = 0; index < manifest.chunkCount; index += 1) {
@@ -198,6 +225,16 @@ export const legadoSubscriptionStore = {
       }
     }
     await db.deleteGlobalValue(manifestKey(id));
+  },
+
+  clearCache(id?: string): void {
+    if (id) {
+      sourcesLoadPromises.delete(id);
+      sourcesCache.delete(id);
+      return;
+    }
+    sourcesLoadPromises.clear();
+    sourcesCache.clear();
   },
 
   mergeMeta(config: AdminConfig, meta: LegadoSubscriptionMeta): AdminConfig {
